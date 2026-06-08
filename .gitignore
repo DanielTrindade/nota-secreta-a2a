@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+logs_tournament/
+pytest-cache-files-*/
+tmppytest-cache-*/
+*.log
+*.gguf
+.env
+.DS_Store
