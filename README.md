@@ -5,8 +5,8 @@ usada como base para a implementação do agente estratégico da disciplina.
 
 > ⚡ **Rodar no Google Colab:** abra o notebook [`nota_secreta_colab.ipynb`](nota_secreta_colab.ipynb).
 > Depois de publicar este repositório no GitHub, dá pra abri-lo direto no Colab pela URL
-> `https://colab.research.google.com/github/SEU_USUARIO/nota-secreta-a2a/blob/main/nota_secreta_colab.ipynb`
-> (troque `SEU_USUARIO`). O notebook clona o repo, instala as dependências, roda os testes
+> `https://colab.research.google.com/github/DanielTrindade/nota-secreta-a2a/blob/main/nota_secreta_colab.ipynb`
+> O notebook clona o repo, instala as dependências, roda os testes
 > e executa uma partida — em modo mock e, opcionalmente, com um modelo GGUF real.
 > Detalhes na seção [13. Rodar no Colab](#13-rodar-no-colab).
 
@@ -311,13 +311,12 @@ para rodar no Google Colab sem precisar configurar nada localmente.
 
 **Como usar:**
 
-1. Publique este repositório no seu GitHub (veja abaixo).
-2. Abra o notebook no Colab por uma destas formas:
-   - pela URL `https://colab.research.google.com/github/SEU_USUARIO/nota-secreta-a2a/blob/main/nota_secreta_colab.ipynb`; **ou**
+1. Abra o notebook no Colab por uma destas formas:
+   - pela URL `https://colab.research.google.com/github/DanielTrindade/nota-secreta-a2a/blob/main/nota_secreta_colab.ipynb`; **ou**
    - no Colab: `Arquivo → Abrir notebook → GitHub`, cole a URL do repo.
-3. Na **seção 1** do notebook, troque `SEU_USUARIO` no `REPO_URL` pelo seu usuário do GitHub.
-4. Rode as células na ordem: clonar → instalar → testar → partida em mock.
-5. A **seção 5** (modelo real) é opcional: instala o `llama-cpp-python`, baixa um GGUF
+2. Rode as células na ordem: clonar → instalar → testar → partida em mock.
+   O `REPO_URL` na seção 1 já aponta para este repositório.
+3. A **seção 5** (modelo real) é opcional: instala o `llama-cpp-python`, baixa um GGUF
    (`Phi-3.5-mini-instruct`, ~2,4 GB) e roda a partida com modelo real. Para acelerar,
    use um runtime com **GPU**.
 
@@ -325,14 +324,15 @@ para rodar no Google Colab sem precisar configurar nada localmente.
 > via `import`, porque o `run_game.py` usa `asyncio.run(...)`, que conflitaria com o event
 > loop já ativo do Colab. Assim o código original é mantido sem nenhuma alteração.
 
-### 13.1. Publicar no GitHub
+### 13.1. Atualizar o repositório no GitHub
 
-Crie um repositório **vazio** chamado `nota-secreta-a2a` no GitHub (sem README/licença) e rode:
+O repositório já está publicado em
+`https://github.com/DanielTrindade/nota-secreta-a2a`. Para enviar novas alterações:
 
 ```bash
-git remote add origin https://github.com/SEU_USUARIO/nota-secreta-a2a.git
-git branch -M main
-git push -u origin main
+git add -A
+git commit -m "mensagem"
+git push
 ```
 
 > Observação: o modelo GGUF (~2,4 GB) **não** faz parte do repositório (está no `.gitignore`).
