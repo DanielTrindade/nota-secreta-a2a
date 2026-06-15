@@ -47,6 +47,7 @@ LLM central é usado (sem embeddings, sem dependências novas).
 
 import argparse
 import logging
+import time
 from typing import Any, Dict, List, Sequence
 
 from fasta2a import A2AApp, tool
@@ -59,6 +60,13 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_MARGEM_MIN = 0.5
 DEFAULT_MARGEM_MAX = 4.0
 
+# Orçamento de tempo (s) para a 1ª geração da dica. Se ela já demorou mais que
+# isto, a 2ª chamada (correção) é pulada e caímos na heurística — assim send_clue
+# nunca encosta no a2a_timeout=90s do Game Master. Medido no torneio: cada
+# geração na CPU custa ~40-56s, então este orçamento desliga a correção na CPU
+# (1 chamada ~50s, seguro) e a mantém só em hardware rápido (GPU, ~3s/chamada).
+DEFAULT_CLUE_CALL_BUDGET = 18.0
+
 
 class CalibratedLLMAgent(LLMAgent):
     def __init__(
@@ -67,10 +75,12 @@ class CalibratedLLMAgent(LLMAgent):
         llm_url: str,
         margem_min: float = DEFAULT_MARGEM_MIN,
         margem_max: float = DEFAULT_MARGEM_MAX,
+        clue_call_budget: float = DEFAULT_CLUE_CALL_BUDGET,
     ):
         super().__init__(name=name, llm_url=llm_url)
         self.margem_min = margem_min
         self.margem_max = margem_max
+        self.clue_call_budget = clue_call_budget
 
     # ------------------------------------------------------------------
     # Narrador: dica calibrada na banda Dixit
@@ -84,21 +94,33 @@ class CalibratedLLMAgent(LLMAgent):
             title = str(self.last_narrator_card.get("title", ""))
 
         prompt = self._build_clue_prompt(lyrics=lyrics, title=title, max_words=max_words)
+        start = time.monotonic()
         raw = await self.llm_generate(
             prompt,
             max_tokens=28,
             temperature=0.55,
             stop=["\n\n", "\nResposta:", "\nAnswer:", "###"],
         )
+        first_call_elapsed = time.monotonic() - start
         clue = self._clean_clue(raw, lyrics=lyrics, title=title, max_words=max_words)
-        clue = await self._calibrate_clue(clue, lyrics=lyrics, title=title, max_words=max_words)
+        clue = await self._calibrate_clue(
+            clue, lyrics=lyrics, title=title, max_words=max_words,
+            first_call_elapsed=first_call_elapsed,
+        )
 
         self.clue_history.append(clue)
         self.round_memory.append({"role": "narrator", "title": title, "clue": clue})
         LOGGER.info("[%s] Dica calibrada: %s", self.name, clue)
         return {"clue": clue}
 
-    async def _calibrate_clue(self, clue: str, lyrics: str, title: str, max_words: int) -> str:
+    async def _calibrate_clue(
+        self,
+        clue: str,
+        lyrics: str,
+        title: str,
+        max_words: int,
+        first_call_elapsed: float = 0.0,
+    ) -> str:
         """Aplica a banda de dificuldade com no máximo UMA correção via LLM."""
         if self._is_degenerate_clue(clue):
             return self._thematic_fallback(lyrics, title, max_words)
@@ -107,7 +129,17 @@ class CalibratedLLMAgent(LLMAgent):
         if difficulty == "calibrated":
             return clue
 
-        # Fora da banda: uma única tentativa corretiva (limite rígido).
+        # A correção custa OUTRA chamada à LLM. Se a 1ª já foi lenta, pular a
+        # correção e usar a heurística — evita estourar o a2a_timeout do GM e
+        # honra o princípio "se demorou, melhor a heurística".
+        if first_call_elapsed > self.clue_call_budget:
+            LOGGER.info(
+                "[%s] 1ª dica levou %.1fs (> %.1fs); pulando correção e usando heurística",
+                self.name, first_call_elapsed, self.clue_call_budget,
+            )
+            return self._thematic_fallback(lyrics, title, max_words)
+
+        # Fora da banda e ainda com tempo: uma única tentativa corretiva.
         direction = "direct" if difficulty == "vague" else "oblique"
         corrected = await self._regenerate_clue(lyrics, title, max_words, direction)
         if (
@@ -277,6 +309,10 @@ def main() -> None:
     parser.add_argument("--name", default=None)
     parser.add_argument("--margem-min", type=float, default=DEFAULT_MARGEM_MIN)
     parser.add_argument("--margem-max", type=float, default=DEFAULT_MARGEM_MAX)
+    parser.add_argument(
+        "--clue-call-budget", type=float, default=DEFAULT_CLUE_CALL_BUDGET,
+        help="Tempo (s) da 1ª geração acima do qual a correção é pulada. 0 desliga a correção.",
+    )
     args = parser.parse_args()
 
     agent = CalibratedLLMAgent(
@@ -284,6 +320,7 @@ def main() -> None:
         llm_url=args.llm_url,
         margem_min=args.margem_min,
         margem_max=args.margem_max,
+        clue_call_budget=args.clue_call_budget,
     )
     app.register(agent)
     app.run(host=args.host, port=args.port)

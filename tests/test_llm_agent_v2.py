@@ -184,3 +184,43 @@ def test_vote_returns_two_valid_distinct_votes():
     assert len(set(votes)) == 2
     assert 2 not in votes                       # nunca vota na própria carta
     assert all(0 <= v < len(options) for v in votes)
+
+
+# ---------------------------------------------------------------------------
+# Orçamento de latência: "se a 1ª chamada demorou, usa a heurística"
+# ---------------------------------------------------------------------------
+
+def test_calibrate_skips_correction_when_first_call_slow():
+    """Dica fora da banda, mas 1ª geração lenta -> NÃO gasta a 2ª chamada."""
+    agent = make_agent()
+    agent.clue_call_budget = 18.0
+    target = card(1, "Sertao", "cidade clara com luz de noite estrelada")  # 'obvious'
+    agent.hand = [target] + DECOYS
+    agent.last_narrator_card = target
+    calls = queue_llm(agent, ["cidade apenas sozinho"])  # seria a correção (calibrada)
+
+    res = asyncio.run(agent._calibrate_clue(
+        "cidade luz noite", lyrics="saudade lembranca do passado distante",
+        title="Sertao", max_words=6, first_call_elapsed=40.0,
+    ))
+
+    assert calls["n"] == 0                 # nenhuma chamada extra à LLM
+    assert res == "memória que insiste"    # foi direto pro fallback temático
+
+
+def test_calibrate_does_correction_when_first_call_fast():
+    """Dica fora da banda e 1ª geração rápida -> faz a única correção permitida."""
+    agent = make_agent()
+    agent.clue_call_budget = 18.0
+    target = card(1, "Sertao", "cidade clara com luz de noite estrelada")  # 'obvious'
+    agent.hand = [target] + DECOYS
+    agent.last_narrator_card = target
+    calls = queue_llm(agent, ["cidade apenas sozinho"])  # correção -> calibrada
+
+    res = asyncio.run(agent._calibrate_clue(
+        "cidade luz noite", lyrics="saudade lembranca do passado distante",
+        title="Sertao", max_words=6, first_call_elapsed=2.0,
+    ))
+
+    assert calls["n"] == 1
+    assert res == "cidade apenas sozinho"
