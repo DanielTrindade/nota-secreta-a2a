@@ -1,4 +1,4 @@
-"""Testes do agente calibrado (llm_agent_v2.CalibratedLLMAgent).
+"""Testes do agente estratégico calibrado (llm_agent.LLMAgent).
 
 Estilo igual ao tests/test_scoring.py: pytest puro, asserções diretas sobre o
 comportamento externo observável. Dois seams:
@@ -15,7 +15,7 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from llm_agent_v2 import CalibratedLLMAgent
+from llm_agent import LLMAgent
 
 
 # ---------------------------------------------------------------------------
@@ -23,8 +23,8 @@ from llm_agent_v2 import CalibratedLLMAgent
 # ---------------------------------------------------------------------------
 
 def make_agent(margem_min=0.5, margem_max=4.0):
-    agent = CalibratedLLMAgent(name="t", llm_url="http://127.0.0.1:1",
-                               margem_min=margem_min, margem_max=margem_max)
+    agent = LLMAgent(name="t", llm_url="http://127.0.0.1:1",
+                     margem_min=margem_min, margem_max=margem_max)
     return agent
 
 

@@ -1,19 +1,53 @@
 from __future__ import annotations
 
-"""Agente estratégico para o jogo Nota Secreta.
+"""Agente estratégico calibrado para o jogo Nota Secreta.
 
 A estratégia é deliberadamente híbrida:
-- a LLM é usada para decisões semânticas e geração de dica;
-- heurísticas locais validam, desempatamente e fazem fallback;
+- a LLM central é usada para decisões semânticas e geração de dica;
+- heurísticas locais validam, desempatam e fazem fallback;
 - todas as tools preservam a interface exigida pelo Game Master.
 
-A implementação evita depender de ids, títulos específicos ou da base local.
-Ela usa apenas título e letra truncada recebidos durante a partida.
+A implementação evita depender de ids, títulos específicos ou da base local:
+usa apenas título e letra truncada recebidos durante a partida. Nada além de
+heurística local determinística + a LLM central é usado (sem embeddings, sem
+dependências novas).
+
+Duas decisões da estratégia vêm direto da regra de pontuação do Game Master
+(``_apply_scoring``):
+
+1) Narrador — calibração de dificuldade em BANDA (zona Dixit).
+   O narrador só pontua (+3) quando *alguns mas não todos* os adversários
+   acertam a carta. Tanto a dica vaga demais (ninguém acerta) quanto a óbvia
+   demais (todos acertam) zeram o narrador e ainda dão +2 aos demais.
+   Classificamos a dica usando as cartas da própria mão como iscas
+   (``_classify_clue_difficulty`` -> "vague" | "calibrated" | "obvious") e,
+   fora da banda, fazemos UMA tentativa corretiva de geração (mais direta se
+   vaga, mais oblíqua se óbvia). Persistindo fora da banda, caímos no fallback
+   temático. Limite rígido de 1 chamada extra por rodada para não estourar o
+   ``a2a_timeout`` do Game Master.
+
+   ATENÇÃO (limitação deliberada): o sinal é overlap lexical
+   (``_semantic_score``) medido sobre a *própria* mão. É um guard-rail contra
+   os extremos (cópia literal de verso vs. dica genérica), não um medidor fino
+   da dificuldade percebida pelos adversários — que seguram outras cartas,
+   invisíveis ao narrador. ``margem_min``/``margem_max`` são empíricos.
+
+2) Não-narrador — blefe explícito em ``select_card_by_clue``.
+   O bônus por votos recebidos na própria carta é pago FORA do if/else de
+   pontuação: é o único canal de pontos incondicional do jogo (até +3 por
+   rodada). Mantemos o merge LLM+heurística, mas o desempate prefere a carta de
+   match semântico mais forte (maior chance de ser confundida com a do
+   narrador) em vez do menor índice.
+
+Memória entre rodadas fica fora de escopo: o Game Master não devolve ao agente
+quem narrou, qual carta venceu nem o placar, então modelagem de oponente é
+impossível neste protocolo.
 """
 
 import argparse
 import logging
 import re
+import time
 from typing import Any, Dict, List, Sequence
 
 from base_agent import BaseAgent
@@ -26,12 +60,33 @@ LOGGER = logging.getLogger(__name__)
 # Saída degenerada conhecida do serviço LLM em modo mock.
 _MOCK_SENTINELS = {"memória tempo cidade", "memoria tempo cidade"}
 
+# Defaults empíricos da banda de dificuldade do narrador.
+DEFAULT_MARGEM_MIN = 0.5
+DEFAULT_MARGEM_MAX = 4.0
+
+# Orçamento de tempo (s) para a 1ª geração da dica. Se ela já demorou mais que
+# isto, a 2ª chamada (correção) é pulada e caímos na heurística — assim send_clue
+# nunca encosta no a2a_timeout=90s do Game Master. Medido no torneio: cada
+# geração na CPU custa ~40-56s, então este orçamento desliga a correção na CPU
+# (1 chamada ~50s, seguro) e a mantém só em hardware rápido (GPU, ~3s/chamada).
+DEFAULT_CLUE_CALL_BUDGET = 18.0
+
 
 class LLMAgent(BaseAgent):
-    def __init__(self, name: str, llm_url: str):
+    def __init__(
+        self,
+        name: str,
+        llm_url: str,
+        margem_min: float = DEFAULT_MARGEM_MIN,
+        margem_max: float = DEFAULT_MARGEM_MAX,
+        clue_call_budget: float = DEFAULT_CLUE_CALL_BUDGET,
+    ):
         super().__init__(name=name, llm_url=llm_url, request_timeout=60.0)
         self.last_narrator_card: Dict[str, Any] | None = None
         self.round_memory: List[Dict[str, Any]] = []
+        self.margem_min = margem_min
+        self.margem_max = margem_max
+        self.clue_call_budget = clue_call_budget
 
     @tool()
     async def receive_hand(self, hand: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -57,52 +112,187 @@ class LLMAgent(BaseAgent):
         LOGGER.info("[%s] Carta narradora escolhida: %s", self.name, chosen.get("title", ""))
         return {"chosen_card": chosen}
 
+    # ------------------------------------------------------------------
+    # Narrador: dica calibrada na banda Dixit
+    # ------------------------------------------------------------------
+
     @tool()
     async def send_clue(self, lyrics: str, max_words: int = 6) -> Dict[str, Any]:
-        """Gera uma dica curta, sem copiar trecho da letra nem usar o título."""
+        """Gera uma dica calibrada: nem vaga (ninguém acha) nem óbvia (todos acham)."""
         title = ""
         if self.last_narrator_card:
             title = str(self.last_narrator_card.get("title", ""))
 
         prompt = self._build_clue_prompt(lyrics=lyrics, title=title, max_words=max_words)
+        start = time.monotonic()
         raw = await self.llm_generate(
             prompt,
             max_tokens=28,
             temperature=0.55,
             stop=["\n\n", "\nResposta:", "\nAnswer:", "###"],
         )
-
+        first_call_elapsed = time.monotonic() - start
         clue = self._clean_clue(raw, lyrics=lyrics, title=title, max_words=max_words)
-
-        # Guarda de robustez + auto-consistência: se a dica degenerou (mock do
-        # serviço LLM / timeout) ou está vaga demais (não aponta nem para a
-        # própria carta dentro da mão), troca por uma dica temática da letra.
-        # Assim o narrador não joga a rodada fora quando o LLM não coopera.
-        if self._is_degenerate_clue(clue) or not self._clue_points_to_card(clue):
-            fallback = self._fallback_thematic_clue(lyrics, title, max_words=max_words)
-            fallback = self._remove_title_words(fallback, title, max_words=max_words)
-            fallback = " ".join(fallback.split()[:max_words]).strip()
-            if fallback and not self._is_degenerate_clue(fallback):
-                clue = fallback
+        clue = await self._calibrate_clue(
+            clue, lyrics=lyrics, title=title, max_words=max_words,
+            first_call_elapsed=first_call_elapsed,
+        )
 
         self.clue_history.append(clue)
         self.round_memory.append({"role": "narrator", "title": title, "clue": clue})
-        LOGGER.info("[%s] Dica gerada: %s", self.name, clue)
+        LOGGER.info("[%s] Dica calibrada: %s", self.name, clue)
         return {"clue": clue}
+
+    async def _calibrate_clue(
+        self,
+        clue: str,
+        lyrics: str,
+        title: str,
+        max_words: int,
+        first_call_elapsed: float = 0.0,
+    ) -> str:
+        """Aplica a banda de dificuldade com no máximo UMA correção via LLM."""
+        if self._is_degenerate_clue(clue):
+            return self._thematic_fallback(lyrics, title, max_words)
+
+        difficulty = self._difficulty_of(clue)
+        if difficulty == "calibrated":
+            return clue
+
+        # A correção custa OUTRA chamada à LLM. Se a 1ª já foi lenta, pular a
+        # correção e usar a heurística — evita estourar o a2a_timeout do GM e
+        # honra o princípio "se demorou, melhor a heurística".
+        if first_call_elapsed > self.clue_call_budget:
+            LOGGER.info(
+                "[%s] 1ª dica levou %.1fs (> %.1fs); pulando correção e usando heurística",
+                self.name, first_call_elapsed, self.clue_call_budget,
+            )
+            return self._thematic_fallback(lyrics, title, max_words)
+
+        # Fora da banda e ainda com tempo: uma única tentativa corretiva.
+        direction = "direct" if difficulty == "vague" else "oblique"
+        corrected = await self._regenerate_clue(lyrics, title, max_words, direction)
+        if (
+            corrected
+            and not self._is_degenerate_clue(corrected)
+            and self._difficulty_of(corrected) == "calibrated"
+        ):
+            return corrected
+
+        # LLM não cooperou após a correção -> fallback temático (nunca joga a rodada fora).
+        return self._thematic_fallback(lyrics, title, max_words)
+
+    def _difficulty_of(self, clue: str) -> str:
+        """Classifica a dica usando a mão atual e a carta-alvo do narrador."""
+        if not self.hand or self.last_narrator_card is None:
+            return "calibrated"
+        return self._classify_clue_difficulty(clue, self.hand, self.last_narrator_card.get("id"))
+
+    def _classify_clue_difficulty(
+        self,
+        clue: str,
+        cards: Sequence[Dict[str, Any]],
+        target_id: Any,
+    ) -> str:
+        """Banda de dificuldade usando as cartas da mão como iscas.
+
+        Guard-rail contra extremos (não um medidor fino): pontua cada carta da
+        mão com ``_semantic_score`` (overlap lexical) e devolve:
+
+        - "vague"      -> alvo não fica em 1º, ou margem para a 2ª < margem_min;
+        - "obvious"    -> margem para a 2ª > margem_max;
+        - "calibrated" -> alvo em 1º e margem dentro de [margem_min, margem_max].
+        """
+        scored = sorted(
+            ((self._semantic_score(card, clue), card.get("id")) for card in cards),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        if not scored:
+            return "vague"
+
+        best_score, best_id = scored[0]
+        if best_score <= 0.0 or best_id != target_id:
+            return "vague"
+
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        margin = best_score - second_score
+        if margin < self.margem_min:
+            return "vague"
+        if margin > self.margem_max:
+            return "obvious"
+        return "calibrated"
+
+    async def _regenerate_clue(self, lyrics: str, title: str, max_words: int, direction: str) -> str:
+        prompt = self._build_clue_correction_prompt(lyrics, title, max_words, direction)
+        raw = await self.llm_generate(
+            prompt,
+            max_tokens=28,
+            temperature=0.6,
+            stop=["\n\n", "\nResposta:", "\nAnswer:", "###"],
+        )
+        return self._clean_clue(raw, lyrics=lyrics, title=title, max_words=max_words)
+
+    def _build_clue_correction_prompt(
+        self,
+        lyrics: str,
+        title: str,
+        max_words: int,
+        direction: str,
+    ) -> str:
+        short_lyrics = " ".join(lyrics.split()[:80])
+        title_rule = f"\nNão use palavras do título: {title}." if title else ""
+        if direction == "direct":
+            adjust = (
+                "A dica anterior ficou vaga demais: ninguém acharia a música.\n"
+                "Crie uma dica mais concreta, com uma imagem ou tema mais nítido da letra,\n"
+                "mas ainda sem copiar verso literal nem citar o título."
+            )
+        else:
+            adjust = (
+                "A dica anterior ficou óbvia demais: todos achariam a música.\n"
+                "Crie uma dica mais oblíqua e poética, sugerindo o clima de longe,\n"
+                "sem palavras diretas da letra nem do título."
+            )
+        return (
+            "Refaça uma dica para Nota Secreta (jogo tipo Dixit com músicas brasileiras).\n"
+            f"A dica deve ter de 2 a {max_words} palavras.\n"
+            f"{adjust}"
+            f"{title_rule}\n\n"
+            f"Letra truncada:\n{short_lyrics}\n\n"
+            "Dica:"
+        )
+
+    def _thematic_fallback(self, lyrics: str, title: str, max_words: int) -> str:
+        fallback = self._fallback_thematic_clue(lyrics, title, max_words=max_words)
+        fallback = self._remove_title_words(fallback, title, max_words=max_words)
+        fallback = " ".join(fallback.split()[:max_words]).strip()
+        if not fallback or self._is_degenerate_clue(fallback):
+            return "memória em trânsito"
+        return fallback
+
+    # ------------------------------------------------------------------
+    # Não-narrador: blefe (maximizar votos recebidos) e voto
+    # ------------------------------------------------------------------
 
     @tool()
     async def select_card_by_clue(self, clue: str) -> Dict[str, Any]:
-        """Escolhe a carta da mão que mais combina com a dica recebida."""
+        """Escolhe a carta que maximiza o blefe (votos recebidos na própria carta)."""
         if not self.hand:
             raise RuntimeError("Hand is empty")
 
         heuristic_order = self._rank_cards_for_clue(clue, self.hand)
         llm_order = await self._llm_rank_cards_by_clue(clue, self.hand, purpose="selecionar")
-        chosen_idx = self._merge_rankings(heuristic_order, llm_order, len(self.hand))[0]
+        # Desempate explícito de blefe: preferir o match semântico mais forte,
+        # que tem maior chance de ser confundido com a carta do narrador.
+        tie_break = {idx: self._semantic_score(card, clue) for idx, card in enumerate(self.hand)}
+        chosen_idx = self._merge_rankings(
+            heuristic_order, llm_order, len(self.hand), tie_break=tie_break
+        )[0]
 
         chosen = self.hand[chosen_idx]
         self.round_memory.append({"role": "melomano", "clue": clue, "played": chosen.get("title", "")})
-        LOGGER.info("[%s] Carta selecionada pela dica '%s': %s", self.name, clue, chosen.get("title", ""))
+        LOGGER.info("[%s] Blefe pela dica '%s': %s", self.name, clue, chosen.get("title", ""))
         return {"chosen_card": chosen}
 
     @tool()
@@ -293,8 +483,13 @@ class LLMAgent(BaseAgent):
         llm_order: Sequence[int],
         n_options: int,
         forbidden_idx: int | None = None,
+        tie_break: Dict[int, float] | None = None,
     ) -> List[int]:
-        """Combina LLM e heurística por Borda count simples."""
+        """Borda count LLM+heurística com desempate opcional por ``tie_break``.
+
+        Sem ``tie_break`` o empate é resolvido pelo menor índice (usado por
+        choose_card e vote); com ``tie_break``, o maior valor vence (blefe).
+        """
         candidates = [idx for idx in range(n_options) if idx != forbidden_idx]
         scores = {idx: 0.0 for idx in candidates}
 
@@ -308,7 +503,12 @@ class LLMAgent(BaseAgent):
             if idx in scores:
                 scores[idx] += 0.05 * (n_options - pos)
 
-        return sorted(candidates, key=lambda idx: (scores[idx], -idx), reverse=True)
+        tb = tie_break or {}
+        return sorted(
+            candidates,
+            key=lambda idx: (scores[idx], tb.get(idx, 0.0), -idx),
+            reverse=True,
+        )
 
     # ------------------------------------------------------------------
     # Sanitização, parsing e utilidades
@@ -335,27 +535,6 @@ class LLMAgent(BaseAgent):
         if norm in _MOCK_SENTINELS:
             return True
         return len(self._extract_keywords(clue)) < 2
-
-    def _clue_points_to_card(self, clue: str) -> bool:
-        """A dica deve apontar para a carta do narrador dentro da própria mão.
-
-        Proxy de "não é vaga demais": se, entre as cartas da mão, a carta
-        escolhida não fica em 1º pela nossa pontuação semântica, a dica
-        provavelmente não levará ninguém à carta certa -> narrador tira 0.
-        """
-        if not self.hand or self.last_narrator_card is None:
-            return True
-        target_id = self.last_narrator_card.get("id")
-        scored = sorted(
-            ((self._semantic_score(card, clue), card.get("id")) for card in self.hand),
-            reverse=True,
-        )
-        if not scored:
-            return True
-        best_score, best_id = scored[0]
-        if best_score <= 0.0:
-            return False
-        return best_id == target_id
 
     def _remove_title_words(self, clue: str, title: str, max_words: int) -> str:
         if not title:
@@ -455,9 +634,21 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--llm-url", default="http://127.0.0.1:9000")
     parser.add_argument("--name", default=None)
+    parser.add_argument("--margem-min", type=float, default=DEFAULT_MARGEM_MIN)
+    parser.add_argument("--margem-max", type=float, default=DEFAULT_MARGEM_MAX)
+    parser.add_argument(
+        "--clue-call-budget", type=float, default=DEFAULT_CLUE_CALL_BUDGET,
+        help="Tempo (s) da 1ª geração acima do qual a correção é pulada. 0 desliga a correção.",
+    )
     args = parser.parse_args()
 
-    agent = LLMAgent(name=args.name or f"LLMAgent_{args.port}", llm_url=args.llm_url)
+    agent = LLMAgent(
+        name=args.name or f"LLMAgent_{args.port}",
+        llm_url=args.llm_url,
+        margem_min=args.margem_min,
+        margem_max=args.margem_max,
+        clue_call_budget=args.clue_call_budget,
+    )
     app.register(agent)
     app.run(host=args.host, port=args.port)
 

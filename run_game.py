@@ -79,7 +79,7 @@ async def main() -> None:
         help="Sobe 6 agentes estratégicos em vez de 1 estratégico + 5 aleatórios.",
     )
     parser.add_argument("--agent", default="llm_agent.py",
-        help="Script do agente estratégico a usar (ex.: llm_agent.py ou llm_agent_v2.py).",
+        help="Script do agente estratégico a usar (padrão: llm_agent.py).",
     )
     parser.add_argument("--llm-max-concurrency", type=int, default=1)
     args = parser.parse_args()
@@ -114,8 +114,7 @@ async def main() -> None:
         await wait_http(f"{game_master_url}/health")
 
         # 3. Subir os agentes.
-        # O nome exibido nos logs deriva do script do agente estratégico, para
-        # deixar claro qual versão está jogando (ex.: llm_agent vs llm_agent_v2).
+        # O nome exibido nos logs deriva do script do agente estratégico.
         strategic_name = Path(args.agent).stem
         if args.all_strategic:
             agent_specs = [

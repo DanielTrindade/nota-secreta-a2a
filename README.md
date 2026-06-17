@@ -48,7 +48,6 @@ Arquivos principais:
 - `llm_agent.py`: agente estratégico a ser estudado e modificado
 - `random_agent.py`: baseline aleatório
 - `run_game.py`: sobe tudo e executa uma partida completa
-- `render_log_readable.py`: transforma logs em uma visualização mais legível
 - `brazilian_songs.csv`: base de músicas usada pelo jogo
 - `tests/`: testes auxiliares
 
@@ -165,11 +164,10 @@ Esses logs ajudam a entender:
 
 ## 8. Como ler os logs
 
-Para transformar um log em uma visualização mais legível:
-
-```bash
-python3 render_log_readable.py logs/partida_xxx.json
-```
+Cada partida gera um arquivo JSON em `logs/` com a rodada, o narrador, a dica,
+as cartas jogadas, os votos e a pontuação acumulada. O JSON pode ser aberto
+direto em qualquer editor; o caminho exato é impresso no terminal ao fim da
+execução.
 
 ---
 
@@ -225,9 +223,12 @@ Fluxo mínimo recomendado:
 
 ## 12. Estratégia implementada no `llm_agent.py`
 
-O agente estratégico implementado usa uma abordagem híbrida:
+O agente estratégico implementado usa uma abordagem híbrida, **calibrada pela
+regra de pontuação do Game Master**:
 
 - **LLM para decisões semânticas**: a LLM ranqueia cartas candidatas e gera dicas associativas.
+- **Dica em banda Dixit (narrador)**: o narrador só pontua quando *alguns mas não todos* acertam. A dica é classificada como vaga / calibrada / óbvia usando as cartas da própria mão como iscas; fora da banda, há **uma única** tentativa corretiva de geração antes do fallback temático, respeitando um orçamento de tempo para não estourar o `a2a_timeout`.
+- **Blefe (não-narrador)**: em `select_card_by_clue`, o desempate prefere o match semântico mais forte — a carta com maior chance de ser confundida com a do narrador — para maximizar os votos recebidos (único canal de pontos incondicional).
 - **Heurísticas como apoio**: quando a LLM falha, demora ou devolve uma resposta fora do formato, o agente usa pontuação local baseada em palavras-chave, título, letra truncada e relação com a dica.
 - **Fallback robusto**: todas as tools retornam respostas válidas mesmo sem modelo real.
 - **Sem overfitting à base local**: a estratégia não usa ids, nomes específicos de músicas, artistas fixos ou regras dependentes do `brazilian_songs.csv`.
@@ -249,7 +250,9 @@ Em `send_clue()`, o prompt pede uma dica de 2 a 6 palavras, sem copiar verso lit
 - remover palavras do título;
 - cair para uma dica temática caso a resposta seja ruim.
 
-Quando não é narrador, `select_card_by_clue()` escolhe a carta da mão que melhor combina semanticamente com a dica, tentando também tornar a própria carta competitiva para receber votos.
+Depois da sanitização, a dica passa pela **calibração de banda**: se ficar vaga ou óbvia demais (medido pela margem semântica sobre as cartas da mão), o agente faz no máximo uma regeração corretiva — mais direta se vaga, mais oblíqua se óbvia — e, persistindo fora da banda, usa o fallback temático.
+
+Quando não é narrador, `select_card_by_clue()` escolhe a carta da mão que melhor combina semanticamente com a dica e, no empate, prefere o match mais forte para **blefar** (tornar a própria carta competitiva para receber votos).
 
 Na votação, `vote()` pede para a LLM ranquear as 6 opções e combina esse ranking com uma heurística local. O agente sempre devolve exatamente dois votos válidos, sem votar na própria carta.
 
